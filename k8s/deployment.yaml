@@ -23,8 +23,6 @@ spec:
           env:
             - name: TESSERACT_DATA_PATH
               value: /usr/share/tessdata
-            - name: HAULER_ALLOWED_ORIGINS
-              value: "https://hauling-companion.jannekeipert.de,http://localhost:5173"
           resources:
             requests:
               cpu: 200m

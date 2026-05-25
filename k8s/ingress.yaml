@@ -6,13 +6,13 @@ spec:
   ingressClassName: traefik
   tls:
     - hosts:
-        - hauling-companion-api.jannekeipert.de
+        - hauling-companion.jannekeipert.de
       secretName: multi-domain-cert
   rules:
-    - host: hauling-companion-api.jannekeipert.de
+    - host: hauling-companion.jannekeipert.de
       http:
         paths:
-          - path: /
+          - path: /api
             pathType: Prefix
             backend:
               service:
