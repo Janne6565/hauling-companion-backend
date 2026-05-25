@@ -32,13 +32,13 @@ spec:
               memory: 1Gi
           readinessProbe:
             httpGet:
-              path: /api/v1/locations
+              path: /api/v1/scmdb/xp-index
               port: 8080
             initialDelaySeconds: 30
             periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /api/v1/locations
+              path: /api/v1/scmdb/xp-index
               port: 8080
             initialDelaySeconds: 60
             periodSeconds: 20
