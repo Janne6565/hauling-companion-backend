@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.Semaphore;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -47,10 +48,27 @@ public class OcrService {
                     "Deliver\\s+(\\d+)/(\\d+)\\s+SCU\\s+of\\s+(.+?)\\s*to\\s+(.+?)(?:\\r?\\n|$)",
                     Pattern.CASE_INSENSITIVE);
 
+    // Tesseract is CPU-bound and holds large BufferedImages in heap; cap concurrency to 1.
+    private final Semaphore ocrSlots = new Semaphore(1);
+
     private final TesseractProperties tesseractProperties;
     private final ScmdbService scmdbService;
 
     public ParsedMissionDto parse(MultipartFile file, RegionConfigDto regions) {
+        try {
+            ocrSlots.acquire();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("OCR request interrupted while waiting in queue", e);
+        }
+        try {
+            return doParse(file, regions);
+        } finally {
+            ocrSlots.release();
+        }
+    }
+
+    private ParsedMissionDto doParse(MultipartFile file, RegionConfigDto regions) {
         try {
             BufferedImage full = ImageIO.read(file.getInputStream());
 
