@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -30,9 +31,25 @@ public class OptimizerService {
 
     private final StarmapService starmapService;
 
+    /** Per-mission planning shape: pickups split into mandatory legs vs. "visit one of" choice groups. */
+    private record MissionShape(
+            List<MissionLegDto> mandatoryPickups, List<ChoiceGroup> choiceGroups, Set<String> deliveryLocs) {}
+
+    /**
+     * A set of interchangeable pickup locations for one material in one mission. The mission leaves the
+     * per-location SCU unset, which we read as "this resource can be collected from any one of these
+     * locations" — so the optimizer visits exactly one, chosen to minimise total stops.
+     */
+    private record ChoiceGroup(int missionIndex, String cargoType, List<MissionLegDto> candidates) {}
+
+    /** Result of resolving choice groups for a subset: which location each group uses, and every visited stop. */
+    private record Resolution(Map<ChoiceGroup, String> picks, Set<String> visited) {}
+
     public OptimizeResultDto optimize(OptimizeRequest request) {
         List<ParsedMissionDto> missions = request.missions();
         int n = missions.size();
+        List<MissionShape> shapes = IntStream.range(0, n).mapToObj(i -> shapeOf(i, missions.get(i))).toList();
+
         int capacity = ShipRegistry.capacityFor(request.ship());
         Set<Integer> forceIn = toSet(request.forceInclude());
         Set<Integer> forceOut = toSet(request.forceExclude());
@@ -42,7 +59,7 @@ public class OptimizerService {
             String currentSystem = starmapService.systemOf(request.currentLocation());
             if (currentSystem != null) {
                 for (int i = 0; i < n; i++) {
-                    if (!forceOut.contains(i) && isInterstellar(missions.get(i), currentSystem)) {
+                    if (!forceOut.contains(i) && isInterstellar(shapes.get(i), currentSystem)) {
                         forceOut.add(i);
                     }
                 }
@@ -51,7 +68,7 @@ public class OptimizerService {
             }
         }
 
-        List<Integer> best = selectBestSubset(missions, n, capacity, request.maxMissions(), request.maxStops(), forceIn, forceOut, byProfit);
+        List<Integer> best = selectBestSubset(missions, shapes, n, capacity, request.maxMissions(), request.maxStops(), forceIn, forceOut, byProfit);
 
         if (best.isEmpty()) {
             return OptimizeResultDto.builder()
@@ -63,7 +80,7 @@ public class OptimizerService {
                     .build();
         }
 
-        List<StopDto> stops = buildStops(missions, best, request.currentLocation());
+        List<StopDto> stops = buildStops(missions, shapes, best, request.currentLocation());
         int totalReward = best.stream().mapToInt(i -> nvl(missions.get(i).rewardUec())).sum();
         int totalXp = best.stream().mapToInt(i -> nvl(missions.get(i).xp())).sum();
 
@@ -78,20 +95,149 @@ public class OptimizerService {
                 .build();
     }
 
-    private boolean isInterstellar(ParsedMissionDto mission, String currentSystem) {
-        for (MissionLegDto leg : mission.pickups()) {
+    // ── Mission shaping ────────────────────────────────────────────────────────────
+
+    /**
+     * Splits a mission's pickups into mandatory legs and choice groups. A pickup with a fixed SCU is
+     * always mandatory. Pickups with no SCU are grouped by material; a group of two or more becomes a
+     * "visit one of" choice, while a lone candidate (or one whose material is unknown) stays mandatory
+     * because there is no real alternative to fall back on.
+     */
+    private MissionShape shapeOf(int idx, ParsedMissionDto m) {
+        List<MissionLegDto> mandatory = new ArrayList<>();
+        Map<String, List<MissionLegDto>> unsetByCargo = new LinkedHashMap<>();
+
+        for (MissionLegDto leg : safe(m.pickups())) {
             if (leg.location() == null) continue;
-            String sys = starmapService.systemOf(leg.location());
-            // null means the wiki doesn't know this location — treat as foreign when
-            // interstellar is disabled, since the wiki reliably covers known in-system locations
-            if (sys == null || !sys.equalsIgnoreCase(currentSystem)) return true;
+            String cargo = effectiveCargo(leg, m);
+            if (isUnset(leg.scu()) && cargo != null && !cargo.isBlank()) {
+                unsetByCargo.computeIfAbsent(cargo, k -> new ArrayList<>()).add(leg);
+            } else {
+                mandatory.add(leg);
+            }
         }
-        for (MissionLegDto leg : mission.deliveries()) {
-            if (leg.location() == null) continue;
-            String sys = starmapService.systemOf(leg.location());
-            if (sys == null || !sys.equalsIgnoreCase(currentSystem)) return true;
+
+        List<ChoiceGroup> groups = new ArrayList<>();
+        for (Map.Entry<String, List<MissionLegDto>> e : unsetByCargo.entrySet()) {
+            List<MissionLegDto> candidates = dedupByLocation(e.getValue());
+            if (candidates.size() == 1) {
+                mandatory.add(candidates.get(0));
+            } else {
+                groups.add(new ChoiceGroup(idx, e.getKey(), candidates));
+            }
+        }
+
+        Set<String> deliveryLocs =
+                safe(m.deliveries()).stream()
+                        .map(MissionLegDto::location)
+                        .filter(Objects::nonNull)
+                        .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        return new MissionShape(mandatory, groups, deliveryLocs);
+    }
+
+    private boolean isInterstellar(MissionShape shape, String currentSystem) {
+        for (MissionLegDto leg : shape.mandatoryPickups()) {
+            if (leg.location() != null && isForeign(leg.location(), currentSystem)) return true;
+        }
+        for (String loc : shape.deliveryLocs()) {
+            if (isForeign(loc, currentSystem)) return true;
+        }
+        // A choice group only forces interstellar travel when every alternative is out of system.
+        for (ChoiceGroup g : shape.choiceGroups()) {
+            boolean allForeign = g.candidates().stream().map(MissionLegDto::location).allMatch(l -> isForeign(l, currentSystem));
+            if (allForeign) return true;
         }
         return false;
+    }
+
+    private boolean isForeign(String location, String currentSystem) {
+        String sys = starmapService.systemOf(location);
+        // null means the wiki doesn't know this location — treat as foreign when interstellar is
+        // disabled, since the wiki reliably covers known in-system locations.
+        return sys == null || !sys.equalsIgnoreCase(currentSystem);
+    }
+
+    // ── Choice-group resolution ──────────────────────────────────────────────────────
+
+    /**
+     * Picks one location per choice group for the given subset, preferring locations that are already
+     * being visited (a mandatory pickup, a delivery, or a stop chosen for another group) so a choice
+     * costs zero extra stops whenever possible. Remaining groups are covered greedily by the location
+     * that satisfies the most of them at once. With {@code useDistance}, ties between equally useful new
+     * locations break toward the one nearest an already-visited stop; otherwise they break by name so the
+     * result is deterministic without touching the starmap during subset scoring.
+     */
+    private Resolution resolve(List<MissionShape> shapes, List<Integer> subset, boolean useDistance, String start) {
+        Set<String> visited = new HashSet<>();
+        List<ChoiceGroup> groups = new ArrayList<>();
+        for (int i : subset) {
+            MissionShape s = shapes.get(i);
+            for (MissionLegDto leg : s.mandatoryPickups()) {
+                if (leg.location() != null) visited.add(leg.location());
+            }
+            visited.addAll(s.deliveryLocs());
+            groups.addAll(s.choiceGroups());
+        }
+
+        Map<ChoiceGroup, String> picks = new HashMap<>();
+        List<ChoiceGroup> unresolved = new ArrayList<>(groups);
+
+        while (true) {
+            boolean freed = false;
+            for (Iterator<ChoiceGroup> it = unresolved.iterator(); it.hasNext(); ) {
+                ChoiceGroup g = it.next();
+                String hit = g.candidates().stream().map(MissionLegDto::location).filter(visited::contains).findFirst().orElse(null);
+                if (hit != null) {
+                    picks.put(g, hit);
+                    it.remove();
+                    freed = true;
+                }
+            }
+            if (unresolved.isEmpty()) break;
+            if (freed) continue;
+
+            Map<String, Integer> coverage = new HashMap<>();
+            for (ChoiceGroup g : unresolved) {
+                for (MissionLegDto c : g.candidates()) coverage.merge(c.location(), 1, Integer::sum);
+            }
+            visited.add(bestNewLocation(coverage, useDistance, start, visited));
+        }
+
+        return new Resolution(picks, visited);
+    }
+
+    /** Highest-coverage location wins; ties break by distance to the nearest visited stop, else by name. */
+    private String bestNewLocation(Map<String, Integer> coverage, boolean useDistance, String start, Set<String> visited) {
+        String best = null;
+        int bestCoverage = -1;
+        double bestDistance = Double.MAX_VALUE;
+        for (Map.Entry<String, Integer> e : coverage.entrySet()) {
+            String loc = e.getKey();
+            int cov = e.getValue();
+            double dist = useDistance ? nearestDistance(loc, visited, start) : 0;
+            boolean better;
+            if (cov != bestCoverage) {
+                better = cov > bestCoverage;
+            } else if (useDistance) {
+                better = dist < bestDistance;
+            } else {
+                better = best == null || loc.compareTo(best) < 0;
+            }
+            if (better) {
+                best = loc;
+                bestCoverage = cov;
+                bestDistance = dist;
+            }
+        }
+        return best;
+    }
+
+    private double nearestDistance(String loc, Set<String> visited, String start) {
+        if (!visited.isEmpty()) {
+            return visited.stream().mapToDouble(v -> starmapService.distanceBetween(v, loc)).min().orElse(Double.MAX_VALUE);
+        }
+        return start != null ? starmapService.distanceBetween(start, loc) : 0;
     }
 
     // ── Subset selection ─────────────────────────────────────────────────────────
@@ -101,10 +247,13 @@ public class OptimizerService {
      *   score = totalValue - stopPenalty * stopCount
      * stopPenalty scales with the average eligible-mission value so the threshold is
      * self-calibrating across rookie (low-value) and veteran (high-value) sessions.
+     * The stop count reflects resolved choice groups, so a subset whose alternatives collapse onto
+     * already-visited locations is scored as the cheaper route it actually is.
      * Hard constraints: capacity, maxMissions, maxStops, forceIn/forceOut.
      */
     private List<Integer> selectBestSubset(
             List<ParsedMissionDto> missions,
+            List<MissionShape> shapes,
             int n,
             int capacity,
             int maxMissions,
@@ -142,7 +291,7 @@ public class OptimizerService {
                             .sum();
             if (capacity < Integer.MAX_VALUE && totalScu > capacity) continue;
 
-            int stops = countUniqueLocations(missions, subset);
+            int stops = resolve(shapes, subset, false, null).visited().size();
             if (stops > maxStops) continue;
 
             int value =
@@ -160,53 +309,62 @@ public class OptimizerService {
         return best != null ? best : (forceIn.isEmpty() ? List.of() : new ArrayList<>(forceIn));
     }
 
-    private int countUniqueLocations(List<ParsedMissionDto> missions, List<Integer> indices) {
-        Set<String> locs = new HashSet<>();
-        for (int i : indices) {
-            missions.get(i).pickups().stream().map(MissionLegDto::location).filter(Objects::nonNull).forEach(locs::add);
-            missions.get(i).deliveries().stream().map(MissionLegDto::location).filter(Objects::nonNull).forEach(locs::add);
-        }
-        return locs.size();
-    }
-
     // ── Stop ordering ────────────────────────────────────────────────────────────
 
     private List<StopDto> buildStops(
-            List<ParsedMissionDto> allMissions, List<Integer> selectedIndices, String startLocation) {
+            List<ParsedMissionDto> allMissions, List<MissionShape> shapes, List<Integer> selectedIndices, String startLocation) {
 
-        // Build per-location maps
+        // Pre-warm the position cache for everything we might touch — including unchosen choice-group
+        // alternatives, since resolution below uses distances to break ties between them.
+        Set<String> allLocs = new LinkedHashSet<>();
+        if (startLocation != null) allLocs.add(startLocation);
+        for (int i : selectedIndices) {
+            MissionShape s = shapes.get(i);
+            s.mandatoryPickups().forEach(l -> {
+                if (l.location() != null) allLocs.add(l.location());
+            });
+            allLocs.addAll(s.deliveryLocs());
+            s.choiceGroups().forEach(g -> g.candidates().forEach(l -> allLocs.add(l.location())));
+        }
+        starmapService.preloadPositions(allLocs);
+
+        Resolution resolution = resolve(shapes, selectedIndices, true, startLocation);
+
+        // Concrete pickup legs to visit per mission: mandatory legs plus the one location chosen per group.
+        Map<Integer, List<MissionLegDto>> resolvedPickups = new HashMap<>();
+        for (int mIdx : selectedIndices) {
+            MissionShape s = shapes.get(mIdx);
+            List<MissionLegDto> legs = new ArrayList<>(s.mandatoryPickups());
+            for (ChoiceGroup g : s.choiceGroups()) {
+                String loc = resolution.picks().get(g);
+                g.candidates().stream().filter(c -> loc.equals(c.location())).findFirst().ifPresent(legs::add);
+            }
+            resolvedPickups.put(mIdx, legs);
+        }
+
+        // Build per-location maps from the resolved pickups (and the missions' deliveries).
         Map<String, List<StopItemDto>> pickupsAt = new LinkedHashMap<>();
         Map<String, List<StopItemDto>> deliveriesAt = new LinkedHashMap<>();
 
         for (int mIdx : selectedIndices) {
-            ParsedMissionDto m = allMissions.get(mIdx);
-            for (MissionLegDto leg : m.pickups()) {
+            for (MissionLegDto leg : resolvedPickups.get(mIdx)) {
                 if (leg.location() == null) continue;
                 pickupsAt.computeIfAbsent(leg.location(), k -> new ArrayList<>())
                         .add(StopItemDto.builder().missionIndex(mIdx).cargoType(leg.cargoType()).scu(leg.scu()).build());
             }
-            for (MissionLegDto leg : m.deliveries()) {
+            for (MissionLegDto leg : allMissions.get(mIdx).deliveries()) {
                 if (leg.location() == null) continue;
                 deliveriesAt.computeIfAbsent(leg.location(), k -> new ArrayList<>())
                         .add(StopItemDto.builder().missionIndex(mIdx).cargoType(leg.cargoType()).scu(leg.scu()).build());
             }
         }
 
-        // Pre-warm position cache for all stop locations before any distance calculation.
-        // Delivery-only stops are never visited in Phase 1, so without this their positions
-        // would be resolved mid-routing — if the API call fails they'd fall back to DEFAULT_POS
-        // and break the nearest-neighbour ordering.
-        Set<String> allLocs = new LinkedHashSet<>(pickupsAt.keySet());
-        allLocs.addAll(deliveriesAt.keySet());
-        if (startLocation != null) allLocs.add(startLocation);
-        starmapService.preloadPositions(allLocs);
-
-        // For each mission: set of pickup locations that must be visited before delivery
+        // For each mission: set of pickup locations that must be visited before delivery.
         Map<Integer, Set<String>> missionPickupLocs = new HashMap<>();
         for (int mIdx : selectedIndices) {
             missionPickupLocs.put(
                     mIdx,
-                    allMissions.get(mIdx).pickups().stream()
+                    resolvedPickups.get(mIdx).stream()
                             .map(MissionLegDto::location)
                             .filter(Objects::nonNull)
                             .collect(Collectors.toSet()));
@@ -293,6 +451,25 @@ public class OptimizerService {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────────
+
+    private static boolean isUnset(Integer scu) {
+        return scu == null || scu <= 0;
+    }
+
+    private static String effectiveCargo(MissionLegDto leg, ParsedMissionDto mission) {
+        if (leg.cargoType() != null && !leg.cargoType().isBlank()) return leg.cargoType();
+        return mission.cargoType();
+    }
+
+    private static List<MissionLegDto> dedupByLocation(List<MissionLegDto> legs) {
+        Map<String, MissionLegDto> byLocation = new LinkedHashMap<>();
+        for (MissionLegDto leg : legs) byLocation.putIfAbsent(leg.location(), leg);
+        return new ArrayList<>(byLocation.values());
+    }
+
+    private static <T> List<T> safe(List<T> list) {
+        return list == null ? List.of() : list;
+    }
 
     private static List<Integer> indicesOf(int mask, int n) {
         List<Integer> list = new ArrayList<>();
