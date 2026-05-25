@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hauling-companion-api
+  labels:
+    app: hauling-companion-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hauling-companion-api
+  template:
+    metadata:
+      labels:
+        app: hauling-companion-api
+    spec:
+      containers:
+        - name: hauling-companion-api
+          image: ghcr.io/janne6565/hauling-companion-backend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: TESSERACT_DATA_PATH
+              value: /usr/share/tessdata
+            - name: HAULER_ALLOWED_ORIGINS
+              value: "https://hauling-companion.jannekeipert.de,http://localhost:5173"
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hauling-companion-api-secrets
+                  key: gemini-api-key
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /api/v1/locations
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/locations
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 20
