@@ -110,7 +110,9 @@ public class OptimizerService {
         for (MissionLegDto leg : safe(m.pickups())) {
             if (leg.location() == null) continue;
             String cargo = effectiveCargo(leg, m);
-            if (isUnset(leg.scu()) && cargo != null && !cargo.isBlank()) {
+            // If the user explicitly marked this leg required, always treat it as mandatory.
+            boolean forcedRequired = Boolean.TRUE.equals(leg.required());
+            if (!forcedRequired && isUnset(leg.scu()) && cargo != null && !cargo.isBlank()) {
                 unsetByCargo.computeIfAbsent(cargo, k -> new ArrayList<>()).add(leg);
             } else {
                 mandatory.add(leg);
@@ -331,20 +333,13 @@ public class OptimizerService {
         Resolution resolution = resolve(shapes, selectedIndices, true, startLocation);
 
         // Concrete pickup legs to visit per mission: mandatory legs plus the one location chosen per group.
-        // Track which (missionIdx, location, cargoType) tuples came from choice groups so we can mark them optional.
-        Set<String> choiceGroupKeys = new HashSet<>();
         Map<Integer, List<MissionLegDto>> resolvedPickups = new HashMap<>();
         for (int mIdx : selectedIndices) {
             MissionShape s = shapes.get(mIdx);
             List<MissionLegDto> legs = new ArrayList<>(s.mandatoryPickups());
             for (ChoiceGroup g : s.choiceGroups()) {
                 String loc = resolution.picks().get(g);
-                g.candidates().stream().filter(c -> loc.equals(c.location())).findFirst().ifPresent(leg -> {
-                    legs.add(leg);
-                    if (leg.location() != null) {
-                        choiceGroupKeys.add(mIdx + ":" + leg.location() + ":" + leg.cargoType());
-                    }
-                });
+                g.candidates().stream().filter(c -> loc.equals(c.location())).findFirst().ifPresent(legs::add);
             }
             resolvedPickups.put(mIdx, legs);
         }
@@ -356,9 +351,8 @@ public class OptimizerService {
         for (int mIdx : selectedIndices) {
             for (MissionLegDto leg : resolvedPickups.get(mIdx)) {
                 if (leg.location() == null) continue;
-                boolean isOptional = choiceGroupKeys.contains(mIdx + ":" + leg.location() + ":" + leg.cargoType());
                 pickupsAt.computeIfAbsent(leg.location(), k -> new ArrayList<>())
-                        .add(StopItemDto.builder().missionIndex(mIdx).cargoType(leg.cargoType()).scu(leg.scu()).optional(isOptional).build());
+                        .add(StopItemDto.builder().missionIndex(mIdx).cargoType(leg.cargoType()).scu(leg.scu()).build());
             }
             for (MissionLegDto leg : allMissions.get(mIdx).deliveries()) {
                 if (leg.location() == null) continue;
