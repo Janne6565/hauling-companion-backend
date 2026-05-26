@@ -331,13 +331,20 @@ public class OptimizerService {
         Resolution resolution = resolve(shapes, selectedIndices, true, startLocation);
 
         // Concrete pickup legs to visit per mission: mandatory legs plus the one location chosen per group.
+        // Track which (missionIdx, location, cargoType) tuples came from choice groups so we can mark them optional.
+        Set<String> choiceGroupKeys = new HashSet<>();
         Map<Integer, List<MissionLegDto>> resolvedPickups = new HashMap<>();
         for (int mIdx : selectedIndices) {
             MissionShape s = shapes.get(mIdx);
             List<MissionLegDto> legs = new ArrayList<>(s.mandatoryPickups());
             for (ChoiceGroup g : s.choiceGroups()) {
                 String loc = resolution.picks().get(g);
-                g.candidates().stream().filter(c -> loc.equals(c.location())).findFirst().ifPresent(legs::add);
+                g.candidates().stream().filter(c -> loc.equals(c.location())).findFirst().ifPresent(leg -> {
+                    legs.add(leg);
+                    if (leg.location() != null) {
+                        choiceGroupKeys.add(mIdx + ":" + leg.location() + ":" + leg.cargoType());
+                    }
+                });
             }
             resolvedPickups.put(mIdx, legs);
         }
@@ -349,8 +356,9 @@ public class OptimizerService {
         for (int mIdx : selectedIndices) {
             for (MissionLegDto leg : resolvedPickups.get(mIdx)) {
                 if (leg.location() == null) continue;
+                boolean isOptional = choiceGroupKeys.contains(mIdx + ":" + leg.location() + ":" + leg.cargoType());
                 pickupsAt.computeIfAbsent(leg.location(), k -> new ArrayList<>())
-                        .add(StopItemDto.builder().missionIndex(mIdx).cargoType(leg.cargoType()).scu(leg.scu()).build());
+                        .add(StopItemDto.builder().missionIndex(mIdx).cargoType(leg.cargoType()).scu(leg.scu()).optional(isOptional).build());
             }
             for (MissionLegDto leg : allMissions.get(mIdx).deliveries()) {
                 if (leg.location() == null) continue;
